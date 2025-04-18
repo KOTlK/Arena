@@ -5,10 +5,6 @@
 #ifndef ARENA_H
 #define ARENA_H
 
-#ifndef REGION_MIN_SIZE
-#define REGION_MIN_SIZE 65536
-#endif
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -24,20 +20,34 @@ extern "C" {
 #define u16 uint16_t
 #endif
 
-#include <stdlib.h>
+// If you need custom allocators for inner arena buffers, define ARENA_CUSTOM_ALLOC
+// and all three allocation methods like this before including arena.h:
+// #define ARENA_CUSTOM_ALLOC
+// #define Arena_Malloc(size) mi_malloc(size)
+// #define Arena_Free(data) mi_free(data)
+// #define Arena_Realloc(data, size) mi_realloc(data, size)
+#ifndef ARENA_CUSTOM_ALLOC
+    #include <stdlib.h>
 
-typedef struct Region Region;
+    #ifndef Arena_Malloc
+        #define Arena_Malloc(size) malloc(size)
+    #endif
 
-struct Region {
-    char   *data;
-    Region *next;
-    u64     capacity;
-    u64     allocated;
-};
+    #ifndef Arena_Free
+        #define Arena_Free(data) free(data)
+    #endif
+
+    #ifndef Arena_Realloc
+        #define Arena_Realloc(data, size) realloc(data, size)
+    #endif
+#endif
+
+#include <assert.h>
 
 typedef struct Arena {
-    Region *root;
-    u64     total;
+    char   *data;
+    u64     capacity;
+    u64     allocated;
 } Arena;
 
 #define push_array(arena, type, count) (type*)(arena_alloc(arena, sizeof(type) * count))
@@ -45,111 +55,32 @@ typedef struct Arena {
 #define push_array_aligned(arena, type, count, align) (type*)(arena_alloc_aligned(arena, sizeof(type) * count, align))
 #define push_struct_aligned(arena, type, align) (type*)(arena_alloc_aligned(arena, sizeof(type), align))
 
-static Region *make_region(u64 capacity);
-static void    region_flush(Region *region);
-static void    region_free(Region *region);
-
-inline static Region *region_get_fit(Region *start, u64 size);
-inline static Region *region_get_fit_aligned(Region *start, u64 size, u16 align);
-
 static        Arena *make_arena(u64 size);
 inline static void  *arena_alloc(Arena *arena, u64 size);
 inline static void  *arena_alloc_aligned(Arena *arena, u64 size, u16 align);
 inline static void   arena_flush(Arena *arena);
 inline static void   arena_free(Arena *arena);
+inline static u16    arena_realloc(Arena *arena, u64 new_size);
 
 #ifdef ARENA_IMPLEMENTATION
 
-static Region *make_region(u64 capacity) {
-    if (capacity < REGION_MIN_SIZE) {
-        capacity = REGION_MIN_SIZE;
-    }
-
-    char *data = (char*)malloc(sizeof(Region) + capacity);
-
-    Region *region = (Region*)data;
-
-    if(!region) {
+static Arena *make_arena(u64 size) {
+    if(size == 0) {
         return NULL;
     }
-
-    region->data        = (char*)(data + sizeof(Region));
-    region->capacity    = capacity;
-    region->allocated   = 0;
-    region->next        = NULL;
-
-    return region;
-}
-
-static void region_flush(Region *region) {
-    region->allocated = 0;
-
-    if(region->next) {
-        region_flush(region->next);
-    }
-}
-
-static void region_free(Region *region) {
-    if(region->next) {
-        region_free(region->next);
-    }
-
-    free(region);
-}
-
-inline static Region *region_get_fit(Region *start, u64 size) {
-    if(start->capacity > start->allocated + size) {
-        return start;
-    }
-
-    while(start->next != NULL) {
-        start = start->next;
-
-        if(start->capacity > start->allocated + size) {
-            return start;
-        }
-    }
-
-    start->next = make_region(size << 1);
-
-    return start->next;
-}
-
-inline static Region *region_get_fit_aligned(Region *start, u64 size, u16 align) {
-    u64 shift = ((u64)start->data + start->allocated) % align;
-    if(shift != 0) shift = align - shift;
-
-    if(start->capacity > start->allocated + shift + size) {
-        return start;
-    }
-
-    while(start->next != NULL) {
-        start = start->next;
-        shift = ((u64)start->data + start->allocated) % align;
-        if(shift != 0) shift = align - shift;
-
-        if(start->capacity > start->allocated + shift + size) {
-            return start;
-        }
-    }
-
-    start->next = make_region(size << 1);
-
-    return start->next;
-}
-
-static Arena *make_arena(u64 size) {
-    Arena *arena = (Arena*)malloc(sizeof(Arena));
+    
+    Arena *arena = (Arena*)Arena_Malloc(sizeof(Arena));
 
     if(!arena) {
         return NULL;
     }
 
-    arena->root  = make_region(size);
-    arena->total = 0;
+    arena->data      = (char*)Arena_Malloc(sizeof(char) * size);
+    arena->allocated = 0;
+    arena->capacity  = size;
 
-    if(!arena->root) {
-        free(arena);
+    if(!arena->data) {
+        Arena_Free(arena);
         return NULL;
     }
 
@@ -157,35 +88,54 @@ static Arena *make_arena(u64 size) {
 }
 
 inline static void *arena_alloc(Arena *arena, u64 size) {
-    Region *region = region_get_fit(arena->root, size);
+    if(arena->capacity < arena->allocated + size) {
+        u16 done = arena_realloc(arena, arena->capacity + size * 2);
 
-    void *data = (region->data + region->allocated);
-    region->allocated += size;
-    arena->total += size;
+        assert(done == 0);
+    }
+
+    void *data = (arena->data + arena->allocated);
+    arena->allocated += size;
+
     return data;
 }
 
 inline static void *arena_alloc_aligned(Arena *arena, u64 size, u16 align) {
-    Region *region = region_get_fit_aligned(arena->root, size, align);
-    u64 shift = ((u64)region->data + region->allocated) % align;
+    u64 shift = ((u64)arena->data + arena->allocated) % align;
     if(shift != 0) shift = align - shift;
 
-    void *data = (region->data + (region->allocated + shift));
-    region->allocated += size + shift;
+    if(arena->capacity < arena->allocated + size + shift) {
+        u16 done = arena_realloc(arena, arena->capacity + size * 2);
 
-    arena->total += size + shift;
+        assert(done == 0);
+    }
+
+    void *data = (arena->data + (arena->allocated + shift));
+    arena->allocated += size + shift;
 
     return data;
 }
 
 inline static void arena_flush(Arena *arena) {
-    region_flush(arena->root);
-    arena->total = 0;
+    arena->allocated = 0;
 }
 
 inline static void arena_free(Arena *arena) {
-    region_free(arena->root);
-    free(arena);
+    Arena_Free(arena->data);
+    Arena_Free(arena);
+}
+
+inline static u16 arena_realloc(Arena *arena, u64 new_size) {
+    void *data = Arena_Realloc(arena->data, new_size);
+
+    if(!data) {
+        return 1;
+    }
+
+    arena->data     = (char*)data;
+    arena->capacity = new_size;
+
+    return 0;
 }
 
 #endif // ARENA_IMPLEMENTATION
